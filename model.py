@@ -1,104 +1,77 @@
-import os
-import pickle
-from zipfile import ZipFile
-from datetime import datetime
+
+
+
+import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
-from updater import download_binance_monthly_data, download_binance_daily_data
-from config import data_base_path, model_file_path
+import talib as ta
+from keras.models import Sequential
+from keras.layers import Dense, LSTM
+from keras.optimizers import Adam
+from sklearn.preprocessing import MinMaxScaler
+import requests
 
+# CoinGecko API'den veri çekme
+def fetch_data_from_coingecko(coin_id='ethereum', vs_currency='usd', days=90):
+    url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart'
+    params = {'vs_currency': vs_currency, 'days': days}
+    response = requests.get(url, params=params)
+    data = response.json()
+    prices = data['prices']
+    df = pd.DataFrame(prices, columns=['timestamp', 'price'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    return df
 
-binance_data_path = os.path.join(data_base_path, "binance/futures-klines")
-training_price_data_path = os.path.join(data_base_path, "eth_price_data.csv")
+# CoinGecko'dan Ethereum fiyat verilerini çekme
+eth_data = fetch_data_from_coingecko('ethereum', 'usd', days=365)
 
+# Veri seti yükleme ve CoinGecko verileriyle birleştirme
+local_data = pd.read_csv('data.csv')  # Örnek yerel veri dosyası
+data = pd.merge(local_data, eth_data, left_index=True, right_index=True, how='outer')
+data.fillna(method='ffill', inplace=True)  # Eksik verileri doldurma
 
-def download_data():
-    cm_or_um = "um"
-    symbols = ["ETHUSDT"]
-    intervals = ["1d"]
-    years = ["2020", "2021", "2022", "2023", "2024"]
-    months = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
-    download_path = binance_data_path
-    download_binance_monthly_data(
-        cm_or_um, symbols, intervals, years, months, download_path
-    )
-    print(f"Downloaded monthly data to {download_path}.")
-    current_datetime = datetime.now()
-    current_year = current_datetime.year
-    current_month = current_datetime.month
-    download_binance_daily_data(
-        cm_or_um, symbols, intervals, current_year, current_month, download_path
-    )
-    print(f"Downloaded daily data to {download_path}.")
+# Kapanış fiyatlarını kullanma
+close_prices = data['price'].values
+close_prices = close_prices.reshape(-1, 1)
 
+# MinMaxScaler kullanarak veriyi normalize etme
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaled_data = scaler.fit_transform(close_prices)
 
-def format_data():
-    files = sorted([x for x in os.listdir(binance_data_path)])
+# RSI hesaplama (14 periyot)
+data['RSI'] = ta.RSI(data['price'], timeperiod=14)
 
-    # No files to process
-    if len(files) == 0:
-        return
+# MACD hesaplama
+data['MACD'], data['MACD_signal'], data['MACD_hist'] = ta.MACD(data['price'], fastperiod=12, slowperiod=26, signalperiod=9)
 
-    price_df = pd.DataFrame()
-    for file in files:
-        zip_file_path = os.path.join(binance_data_path, file)
+# Özellikler ve hedefler oluşturma
+X = []
+y = []
+window_size = 60
 
-        if not zip_file_path.endswith(".zip"):
-            continue
+for i in range(window_size, len(scaled_data)):
+    X.append(scaled_data[i-window_size:i, 0])
+    y.append(scaled_data[i, 0])
 
-        myzip = ZipFile(zip_file_path)
-        with myzip.open(myzip.filelist[0]) as f:
-            line = f.readline()
-            header = 0 if line.decode("utf-8").startswith("open_time") else None
-        df = pd.read_csv(myzip.open(myzip.filelist[0]), header=header).iloc[:, :11]
-        df.columns = [
-            "start_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "end_time",
-            "volume_usd",
-            "n_trades",
-            "taker_volume",
-            "taker_volume_usd",
-        ]
-        df.index = [pd.Timestamp(x + 1, unit="ms") for x in df["end_time"]]
-        df.index.name = "date"
-        price_df = pd.concat([price_df, df])
+X, y = np.array(X), np.array(y)
+X = np.reshape(X, (X.shape[0], X.shape[1], 1))
 
-    price_df.sort_index().to_csv(training_price_data_path)
+# LSTM modeli oluşturma
+model = Sequential()
+model.add(LSTM(units=50, return_sequences=True, input_shape=(X.shape[1], 1)))
+model.add(LSTM(units=50))
+model.add(Dense(units=1))
 
+# Öğrenme oranını artırarak modeli derleme
+model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
 
-def train_model():
-    # Load the eth price data
-    price_data = pd.read_csv(training_price_data_path)
-    df = pd.DataFrame()
+# Modeli eğitme
+model.fit(X, y, epochs=25, batch_size=32)
 
-    # Convert 'date' to a numerical value (timestamp) we can use for regression
-    df["date"] = pd.to_datetime(price_data["date"])
-    df["date"] = df["date"].map(pd.Timestamp.timestamp)
+# Tahmin yapma
+predicted_prices = model.predict(X)
+predicted_prices = scaler.inverse_transform(predicted_prices)
 
-    df["price"] = price_data[["open", "close", "high", "low"]].mean(axis=1)
+# Sonuçları yazdırma
+print(predicted_prices)
 
-    # Reshape the data to the shape expected by sklearn
-    x = df["date"].values.reshape(-1, 1)
-    y = df["price"].values.reshape(-1, 1)
-
-    # Split the data into training set and test set
-    x_train, _, y_train, _ = train_test_split(x, y, test_size=0.2, random_state=0)
-
-    # Train the model
-    model = LinearRegression()
-    model.fit(x_train, y_train)
-
-    # create the model's parent directory if it doesn't exist
-    os.makedirs(os.path.dirname(model_file_path), exist_ok=True)
-
-    # Save the trained model to a file
-    with open(model_file_path, "wb") as f:
-        pickle.dump(model, f)
-
-    print(f"Trained model saved to {model_file_path}")
